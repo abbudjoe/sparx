@@ -16,6 +16,7 @@ fn run() -> Result<(), String> {
     let mut width = None;
     let mut threshold: u8 = 128;
     let mut color = true;
+    let mut dither = true;
 
     let remaining: Vec<String> = args.collect();
     let mut i = 0;
@@ -35,6 +36,10 @@ fn run() -> Result<(), String> {
                 color = false;
                 i += 1;
             }
+            "--no-dither" => {
+                dither = false;
+                i += 1;
+            }
             _ => return Err(format!("Unknown argument: {}\n{}", remaining[i], usage())),
         }
     }
@@ -43,7 +48,7 @@ fn run() -> Result<(), String> {
         width,
         threshold,
         color,
-        dither: true,
+        dither,
     };
 
     let rendered = render_file(&image_path, &cfg).map_err(|e| e.to_string())?;
@@ -64,5 +69,5 @@ fn parse_u8(value: &str, name: &str) -> Result<u8, String> {
 }
 
 fn usage() -> String {
-    "Usage: sparx <image_path> [--width N] [--threshold N] [--no-color]".to_string()
+    "Usage: sparx <image_path> [--width N] [--threshold N] [--no-color] [--no-dither]".to_string()
 }
