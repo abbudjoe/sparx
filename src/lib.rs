@@ -103,9 +103,13 @@ fn render_dynamic_image(
             let x = col * 2;
             let y = row * 4;
             let bits = braille_bits_rgba(&resized, x, y, config.threshold);
+            if bits == 0 {
+                output.push(' ');
+                continue;
+            }
             let ch = braille_char(bits)?;
             if config.color {
-                let (r, g, b) = average_block_rgb_rgba(&resized, x, y);
+                let (r, g, b) = average_block_rgb_rgba(&resized, x, y, config.threshold);
                 output.push_str(&format!("\x1b[38;2;{r};{g};{b}m{ch}\x1b[0m"));
             } else {
                 output.push(ch);
@@ -125,7 +129,7 @@ fn target_dimensions(image: &DynamicImage, width_cols: Option<u32>) -> (u32, u32
     let (orig_w, orig_h) = image.dimensions();
     let orig_w = orig_w.max(1);
     let aspect = orig_h as f32 / orig_w as f32;
-    let raw_h = (aspect * target_width_px as f32 / 2.0).round() as u32;
+    let raw_h = (aspect * target_width_px as f32 / 4.0).round() as u32;
     let clamped_h = raw_h.max(4);
     let target_height_px = round_up_to_multiple(clamped_h, 4);
     (target_width_px, target_height_px)
@@ -143,12 +147,7 @@ fn round_up_to_multiple(value: u32, multiple: u32) -> u32 {
 /// Minimum alpha to consider a pixel "visible" (0-255).
 const ALPHA_THRESHOLD: u8 = 64;
 
-fn braille_bits_rgba(
-    image: &image::RgbaImage,
-    x: u32,
-    y: u32,
-    threshold: u8,
-) -> u8 {
+fn braille_bits_rgba(image: &image::RgbaImage, x: u32, y: u32, threshold: u8) -> u8 {
     let mut bits = 0u8;
     let map: [((u32, u32), u8); 8] = [
         ((0, 0), 0x01),
@@ -186,11 +185,7 @@ fn braille_char(bits: u8) -> Result<char, RenderError> {
     char::from_u32(code).ok_or(RenderError::InvalidBrailleCode(code))
 }
 
-fn average_block_rgb_rgba(
-    image: &image::RgbaImage,
-    x: u32,
-    y: u32,
-) -> (u8, u8, u8) {
+fn average_block_rgb_rgba(image: &image::RgbaImage, x: u32, y: u32, threshold: u8) -> (u8, u8, u8) {
     let mut r = 0u32;
     let mut g = 0u32;
     let mut b = 0u32;
@@ -199,8 +194,12 @@ fn average_block_rgb_rgba(
     for dy in 0..4 {
         for dx in 0..2 {
             let p = image.get_pixel(x + dx, y + dy);
-            // Only average visible pixels
+            // Only average visible pixels above threshold.
             if p[3] < ALPHA_THRESHOLD {
+                continue;
+            }
+            let lum = luminance(p[0], p[1], p[2]);
+            if lum <= threshold {
                 continue;
             }
             r += u32::from(p[0]);
@@ -288,13 +287,13 @@ mod tests {
     #[test]
     fn render_black_pixel_single_empty_braille() {
         let bytes = png_bytes(1, 1, Rgba([0, 0, 0, 255]));
-        assert_eq!(render(&bytes, 1, 128, false), "⠀\n");
+        assert_eq!(render(&bytes, 1, 128, false), " \n");
     }
 
     #[test]
     fn transparent_pixel_renders_empty() {
         let bytes = png_bytes(1, 1, Rgba([255, 255, 255, 0]));
-        assert_eq!(render(&bytes, 1, 128, false), "⠀\n");
+        assert_eq!(render(&bytes, 1, 128, false), " \n");
     }
 
     #[test]
@@ -315,8 +314,26 @@ mod tests {
     }
 
     #[test]
+    fn dark_block_renders_as_space() {
+        let bytes = png_bytes(2, 4, Rgba([0, 0, 0, 255]));
+        assert_eq!(render(&bytes, 1, 128, false), " \n");
+    }
+
+    #[test]
+    fn color_average_excludes_dark_pixels() {
+        let img = ImageBuffer::from_fn(2, 4, |x, _y| {
+            if x == 0 {
+                Rgba([220, 180, 140, 255])
+            } else {
+                Rgba([10, 10, 10, 255])
+            }
+        });
+        let (r, g, b) = average_block_rgb_rgba(&img, 0, 0, 128);
+        assert_eq!((r, g, b), (220, 180, 140));
+    }
+    #[test]
     fn color_mode_contains_ansi_escape() {
-        let bytes = png_bytes(1, 1, Rgba([200, 100, 50, 255]));
+        let bytes = png_bytes(1, 1, Rgba([250, 220, 180, 255]));
         let output = render(&bytes, 1, 128, true);
         assert!(output.contains("\x1b[38;2;"));
     }
