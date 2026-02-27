@@ -1,0 +1,14 @@
+[package]
+name = "sparx"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal image-to-terminal renderer. Braille + truecolor ANSI."
+license = "MIT"
+repository = "https://github.com/abbudjoe/sparx"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[[bin]]
+name = "sparx"
+path = "src/main.rs"
