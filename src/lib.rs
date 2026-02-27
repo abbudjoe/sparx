@@ -129,6 +129,8 @@ fn target_dimensions(image: &DynamicImage, width_cols: Option<u32>) -> (u32, u32
     let (orig_w, orig_h) = image.dimensions();
     let orig_w = orig_w.max(1);
     let aspect = orig_h as f32 / orig_w as f32;
+    // Braille cells are 2px wide × 4px tall. Terminal cells have ~1:2 width:height
+    // aspect ratio. Combined correction: (4 image rows / 2 image cols) × (1 / 2 terminal aspect) = 4.
     let raw_h = (aspect * target_width_px as f32 / 4.0).round() as u32;
     let clamped_h = raw_h.max(4);
     let target_height_px = round_up_to_multiple(clamped_h, 4);
@@ -320,6 +322,17 @@ mod tests {
     }
 
     #[test]
+    fn dark_block_in_color_mode_emits_no_ansi() {
+        let bytes = png_bytes(2, 4, Rgba([0, 0, 0, 255]));
+        let output = render(&bytes, 1, 128, true);
+        assert!(
+            !output.contains("\x1b["),
+            "dark block should not emit ANSI escapes"
+        );
+        assert_eq!(output.trim_end(), " ".repeat(output.trim_end().len()));
+    }
+
+    #[test]
     fn color_average_excludes_dark_pixels() {
         let img = ImageBuffer::from_fn(2, 4, |x, _y| {
             if x == 0 {
@@ -330,6 +343,21 @@ mod tests {
         });
         let (r, g, b) = average_block_rgb_rgba(&img, 0, 0, 128);
         assert_eq!((r, g, b), (220, 180, 140));
+    }
+
+    #[test]
+    fn color_average_excludes_transparent_and_dark_pixels() {
+        let img = ImageBuffer::from_fn(2, 4, |x, y| {
+            if x == 0 && y < 2 {
+                Rgba([200, 150, 100, 255])
+            } else if x == 1 && y < 2 {
+                Rgba([200, 150, 100, 0])
+            } else {
+                Rgba([10, 10, 10, 255])
+            }
+        });
+        let (r, g, b) = average_block_rgb_rgba(&img, 0, 0, 128);
+        assert_eq!((r, g, b), (200, 150, 100));
     }
     #[test]
     fn color_mode_contains_ansi_escape() {
@@ -351,6 +379,24 @@ mod tests {
         let output = render(&bytes, 7, 128, false);
         let line = output.lines().next().expect("line should exist");
         assert_eq!(line.chars().count(), 7);
+    }
+
+    #[test]
+    fn target_dimensions_square_image() {
+        let img =
+            DynamicImage::ImageRgba8(ImageBuffer::from_fn(100, 100, |_, _| Rgba([0, 0, 0, 255])));
+        let (w, h) = target_dimensions(&img, Some(40));
+        assert_eq!(w, 80);
+        assert_eq!(h, 20);
+    }
+
+    #[test]
+    fn target_dimensions_wide_image() {
+        let img =
+            DynamicImage::ImageRgba8(ImageBuffer::from_fn(200, 100, |_, _| Rgba([0, 0, 0, 255])));
+        let (w, h) = target_dimensions(&img, Some(40));
+        assert_eq!(w, 80);
+        assert_eq!(h, 12);
     }
 
     #[test]
