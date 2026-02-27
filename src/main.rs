@@ -43,6 +43,7 @@ fn run() -> Result<(), String> {
         width,
         threshold,
         color,
+        dither: true,
     };
 
     let rendered = render_file(&image_path, &cfg).map_err(|e| e.to_string())?;
