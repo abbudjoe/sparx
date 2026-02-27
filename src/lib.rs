@@ -59,6 +59,8 @@ pub struct RenderConfig {
     pub threshold: u8,
     /// Whether to use truecolor ANSI. If false, no color.
     pub color: bool,
+    /// Enable Floyd-Steinberg dithering for smoother gradients. Default: true.
+    pub dither: bool,
 }
 
 impl Default for RenderConfig {
@@ -67,6 +69,7 @@ impl Default for RenderConfig {
             width: None,
             threshold: 128,
             color: true,
+            dither: true,
         }
     }
 }
@@ -94,6 +97,32 @@ fn render_dynamic_image(
         .resize_exact(target_width_px, target_height_px, FilterType::Lanczos3)
         .to_rgba8();
 
+    let (img_w, img_h) = resized.dimensions();
+    let mut lum_buf = Vec::with_capacity((img_w * img_h) as usize);
+    let mut alpha_mask = Vec::with_capacity((img_w * img_h) as usize);
+    for y in 0..img_h {
+        for x in 0..img_w {
+            let p = resized.get_pixel(x, y);
+            let lum = if p[3] < ALPHA_THRESHOLD {
+                0.0
+            } else {
+                luminance(p[0], p[1], p[2]) as f32
+            };
+            lum_buf.push(lum);
+            alpha_mask.push(p[3] >= ALPHA_THRESHOLD);
+        }
+    }
+
+    if config.dither {
+        floyd_steinberg_dither(
+            &mut lum_buf,
+            &alpha_mask,
+            img_w,
+            img_h,
+            config.threshold as f32,
+        );
+    }
+
     let mut output = String::new();
     let rows = target_height_px / 4;
     let cols = target_width_px / 2;
@@ -102,7 +131,11 @@ fn render_dynamic_image(
         for col in 0..cols {
             let x = col * 2;
             let y = row * 4;
-            let bits = braille_bits_rgba(&resized, x, y, config.threshold);
+            let bits = if config.dither {
+                braille_bits_from_lum_buf(&lum_buf, target_width_px, x, y)
+            } else {
+                braille_bits_rgba(&resized, x, y, config.threshold)
+            };
             if bits == 0 {
                 output.push(' ');
                 continue;
@@ -148,6 +181,68 @@ fn round_up_to_multiple(value: u32, multiple: u32) -> u32 {
 
 /// Minimum alpha to consider a pixel "visible" (0-255).
 const ALPHA_THRESHOLD: u8 = 64;
+
+/// Apply Floyd-Steinberg error diffusion to a luminance buffer.
+fn floyd_steinberg_dither(
+    lum: &mut [f32],
+    alpha_mask: &[bool],
+    width: u32,
+    height: u32,
+    threshold: f32,
+) {
+    let w = width as usize;
+    for y in 0..height as usize {
+        for x in 0..w {
+            let idx = y * w + x;
+            if !alpha_mask[idx] {
+                lum[idx] = 0.0;
+                continue;
+            }
+
+            let old = lum[idx];
+            let new_val = if old > threshold { 255.0 } else { 0.0 };
+            lum[idx] = new_val;
+            let error = old - new_val;
+
+            if x + 1 < w && alpha_mask[idx + 1] {
+                lum[idx + 1] += error * 7.0 / 16.0;
+            }
+            if y + 1 < height as usize {
+                let below = (y + 1) * w;
+                if x > 0 && alpha_mask[below + (x - 1)] {
+                    lum[below + (x - 1)] += error * 3.0 / 16.0;
+                }
+                if alpha_mask[below + x] {
+                    lum[below + x] += error * 5.0 / 16.0;
+                }
+                if x + 1 < w && alpha_mask[below + (x + 1)] {
+                    lum[below + (x + 1)] += error * 1.0 / 16.0;
+                }
+            }
+        }
+    }
+}
+
+fn braille_bits_from_lum_buf(lum_buf: &[f32], img_width: u32, x: u32, y: u32) -> u8 {
+    let mut bits = 0u8;
+    let map: [((u32, u32), u8); 8] = [
+        ((0, 0), 0x01),
+        ((0, 1), 0x02),
+        ((0, 2), 0x04),
+        ((1, 0), 0x08),
+        ((1, 1), 0x10),
+        ((1, 2), 0x20),
+        ((0, 3), 0x40),
+        ((1, 3), 0x80),
+    ];
+    for ((dx, dy), bit) in map {
+        let idx = (y + dy) as usize * img_width as usize + (x + dx) as usize;
+        if lum_buf[idx] > 128.0 {
+            bits |= bit;
+        }
+    }
+    bits
+}
 
 fn braille_bits_rgba(image: &image::RgbaImage, x: u32, y: u32, threshold: u8) -> u8 {
     let mut bits = 0u8;
@@ -276,8 +371,85 @@ mod tests {
             width: Some(width),
             threshold,
             color,
+            dither: true,
         };
         render_image(bytes, &cfg).expect("render should succeed")
+    }
+
+    #[test]
+    fn dithered_output_differs_from_non_dithered_for_gradient() {
+        let img = ImageBuffer::from_fn(20, 8, |x, _y| {
+            let v = (x as f32 / 19.0 * 255.0) as u8;
+            Rgba([v, v, v, 255])
+        });
+        let dynimg = DynamicImage::ImageRgba8(img);
+        let mut bytes = Vec::new();
+        dynimg
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("png encode should succeed");
+
+        let dithered = render(&bytes, 10, 128, false);
+        let cfg_no_dither = RenderConfig {
+            width: Some(10),
+            threshold: 128,
+            color: false,
+            dither: false,
+        };
+        let not_dithered = render_image(&bytes, &cfg_no_dither).expect("render should succeed");
+        assert_ne!(
+            dithered, not_dithered,
+            "dithering should change output for gradients"
+        );
+    }
+
+    #[test]
+    fn dithering_does_not_light_up_transparent_pixels() {
+        let img = ImageBuffer::from_fn(4, 4, |x, _y| {
+            if x < 2 {
+                Rgba([255, 255, 255, 255])
+            } else {
+                Rgba([255, 255, 255, 0])
+            }
+        });
+        let dynimg = DynamicImage::ImageRgba8(img);
+        let mut bytes = Vec::new();
+        dynimg
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("png encode should succeed");
+
+        let cfg = RenderConfig {
+            width: Some(2),
+            threshold: 128,
+            color: false,
+            dither: true,
+        };
+        let output = render_image(&bytes, &cfg).expect("render should succeed");
+        let chars: Vec<char> = output
+            .lines()
+            .next()
+            .expect("line should exist")
+            .chars()
+            .collect();
+        assert_eq!(chars.len(), 2);
+        assert_eq!(
+            chars[1], ' ',
+            "transparent region should remain empty even with dithering"
+        );
+    }
+
+    #[test]
+    fn dither_disabled_matches_original_behavior() {
+        let bytes = png_bytes(1, 1, Rgba([255, 255, 255, 255]));
+        let cfg = RenderConfig {
+            width: Some(1),
+            threshold: 128,
+            color: false,
+            dither: false,
+        };
+        assert_eq!(
+            render_image(&bytes, &cfg).expect("render should succeed"),
+            "⣿\n"
+        );
     }
 
     #[test]
