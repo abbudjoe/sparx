@@ -163,8 +163,9 @@ fn target_dimensions(image: &DynamicImage, width_cols: Option<u32>) -> (u32, u32
     let orig_w = orig_w.max(1);
     let aspect = orig_h as f32 / orig_w as f32;
     // Braille cells are 2px wide × 4px tall. Terminal cells have ~1:2 width:height
-    // aspect ratio. Combined correction: (4 image rows / 2 image cols) × (1 / 2 terminal aspect) = 4.
-    let raw_h = (aspect * target_width_px as f32 / 4.0).round() as u32;
+    // ratio, so each pixel's physical size is cell_w/2 wide and cell_h/4 = cell_w/2
+    // tall — equal in both axes. No correction factor is needed.
+    let raw_h = (aspect * target_width_px as f32).round() as u32;
     let clamped_h = raw_h.max(4);
     let target_height_px = round_up_to_multiple(clamped_h, 4);
     (target_width_px, target_height_px)
@@ -559,7 +560,7 @@ mod tests {
             DynamicImage::ImageRgba8(ImageBuffer::from_fn(100, 100, |_, _| Rgba([0, 0, 0, 255])));
         let (w, h) = target_dimensions(&img, Some(40));
         assert_eq!(w, 80);
-        assert_eq!(h, 20);
+        assert_eq!(h, 80);
     }
 
     #[test]
@@ -568,7 +569,7 @@ mod tests {
             DynamicImage::ImageRgba8(ImageBuffer::from_fn(200, 100, |_, _| Rgba([0, 0, 0, 255])));
         let (w, h) = target_dimensions(&img, Some(40));
         assert_eq!(w, 80);
-        assert_eq!(h, 12);
+        assert_eq!(h, 40);
     }
 
     #[test]
