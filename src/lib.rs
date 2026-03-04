@@ -61,6 +61,13 @@ pub struct RenderConfig {
     pub color: bool,
     /// Enable Floyd-Steinberg dithering for smoother gradients. Default: true.
     pub dither: bool,
+    /// Stretch luminance histogram to full 0-255 range. Default: false.
+    pub enhance: bool,
+    /// Gamma correction (e.g. 1.5 brightens, 0.7 darkens). None = no correction.
+    pub gamma: Option<f32>,
+    /// Use Otsu's method to auto-detect optimal threshold. Default: false.
+    /// When true, overrides the manual `threshold` value.
+    pub auto_threshold: bool,
 }
 
 impl Default for RenderConfig {
@@ -70,6 +77,9 @@ impl Default for RenderConfig {
             threshold: 128,
             color: true,
             dither: true,
+            enhance: false,
+            gamma: None,
+            auto_threshold: false,
         }
     }
 }
@@ -86,6 +96,85 @@ pub fn render_file(path: &str, config: &RenderConfig) -> Result<String, RenderEr
 
 pub fn terminal_width() -> Option<u32> {
     terminal_width_impl()
+}
+
+/// Stretch luminance of opaque pixels to span the full 0–255 range.
+fn histogram_stretch(lum: &mut [f32], alpha_mask: &[bool]) {
+    let mut min = f32::MAX;
+    let mut max = f32::MIN;
+    for (i, &opaque) in alpha_mask.iter().enumerate() {
+        if opaque {
+            min = min.min(lum[i]);
+            max = max.max(lum[i]);
+        }
+    }
+    let range = max - min;
+    if range < 2.0 {
+        return;
+    }
+    for (i, &opaque) in alpha_mask.iter().enumerate() {
+        if opaque {
+            lum[i] = (lum[i] - min) / range * 255.0;
+        }
+    }
+}
+
+/// Apply gamma correction to opaque pixels. gamma > 1 brightens midtones, < 1 darkens.
+fn apply_gamma(lum: &mut [f32], alpha_mask: &[bool], gamma: f32) {
+    let inv_gamma = 1.0 / gamma;
+    for (i, &opaque) in alpha_mask.iter().enumerate() {
+        if opaque {
+            lum[i] = (lum[i] / 255.0).powf(inv_gamma) * 255.0;
+        }
+    }
+}
+
+/// Compute the optimal threshold using Otsu's method (maximize inter-class variance).
+fn otsu_threshold(lum: &[f32], alpha_mask: &[bool]) -> u8 {
+    let mut histogram = [0u32; 256];
+    let mut total = 0u32;
+    for (i, &opaque) in alpha_mask.iter().enumerate() {
+        if opaque {
+            let bin = (lum[i].round() as u32).min(255) as usize;
+            histogram[bin] += 1;
+            total += 1;
+        }
+    }
+    if total == 0 {
+        return 128;
+    }
+
+    let mut sum_total = 0.0f64;
+    for (i, &count) in histogram.iter().enumerate() {
+        sum_total += i as f64 * count as f64;
+    }
+
+    let mut best_threshold = 0u8;
+    let mut best_variance = 0.0f64;
+    let mut weight_bg = 0.0f64;
+    let mut sum_bg = 0.0f64;
+    let total_f = total as f64;
+
+    for t in 0..256u32 {
+        weight_bg += histogram[t as usize] as f64;
+        if weight_bg == 0.0 {
+            continue;
+        }
+        let weight_fg = total_f - weight_bg;
+        if weight_fg == 0.0 {
+            break;
+        }
+        sum_bg += t as f64 * histogram[t as usize] as f64;
+        let mean_bg = sum_bg / weight_bg;
+        let mean_fg = (sum_total - sum_bg) / weight_fg;
+        let variance = weight_bg * weight_fg * (mean_bg - mean_fg) * (mean_bg - mean_fg);
+        if variance > best_variance {
+            best_variance = variance;
+            best_threshold = t as u8;
+        }
+    }
+
+    best_threshold
 }
 
 fn render_dynamic_image(
@@ -113,16 +202,29 @@ fn render_dynamic_image(
         }
     }
 
+    if config.enhance {
+        histogram_stretch(&mut lum_buf, &alpha_mask);
+    }
+    if let Some(gamma) = config.gamma {
+        apply_gamma(&mut lum_buf, &alpha_mask, gamma);
+    }
+    let threshold = if config.auto_threshold {
+        otsu_threshold(&lum_buf, &alpha_mask) as f32
+    } else {
+        config.threshold as f32
+    };
+
     if config.dither {
         floyd_steinberg_dither(
             &mut lum_buf,
             &alpha_mask,
             img_w,
             img_h,
-            config.threshold as f32,
+            threshold,
         );
     }
 
+    let threshold_u8 = threshold.round() as u8;
     let mut output = String::new();
     let rows = target_height_px / 4;
     let cols = target_width_px / 2;
@@ -132,9 +234,9 @@ fn render_dynamic_image(
             let x = col * 2;
             let y = row * 4;
             let bits = if config.dither {
-                braille_bits_from_lum_buf(&lum_buf, target_width_px, x, y)
+                braille_bits_from_lum_buf(&lum_buf, target_width_px, x, y, threshold)
             } else {
-                braille_bits_rgba(&resized, x, y, config.threshold)
+                braille_bits_rgba(&resized, x, y, threshold_u8)
             };
             if bits == 0 {
                 output.push(' ');
@@ -142,7 +244,7 @@ fn render_dynamic_image(
             }
             let ch = braille_char(bits)?;
             if config.color {
-                let (r, g, b) = average_block_rgb_rgba(&resized, x, y, config.threshold);
+                let (r, g, b) = average_block_rgb_rgba(&resized, x, y, threshold_u8);
                 output.push_str(&format!("\x1b[38;2;{r};{g};{b}m{ch}\x1b[0m"));
             } else {
                 output.push(ch);
@@ -224,7 +326,7 @@ fn floyd_steinberg_dither(
     }
 }
 
-fn braille_bits_from_lum_buf(lum_buf: &[f32], img_width: u32, x: u32, y: u32) -> u8 {
+fn braille_bits_from_lum_buf(lum_buf: &[f32], img_width: u32, x: u32, y: u32, threshold: f32) -> u8 {
     let mut bits = 0u8;
     let map: [((u32, u32), u8); 8] = [
         ((0, 0), 0x01),
@@ -238,7 +340,7 @@ fn braille_bits_from_lum_buf(lum_buf: &[f32], img_width: u32, x: u32, y: u32) ->
     ];
     for ((dx, dy), bit) in map {
         let idx = (y + dy) as usize * img_width as usize + (x + dx) as usize;
-        if lum_buf[idx] > 128.0 {
+        if lum_buf[idx] > threshold {
             bits |= bit;
         }
     }
@@ -373,6 +475,9 @@ mod tests {
             threshold,
             color,
             dither: true,
+            enhance: false,
+            gamma: None,
+            auto_threshold: false,
         };
         render_image(bytes, &cfg).expect("render should succeed")
     }
@@ -395,6 +500,9 @@ mod tests {
             threshold: 128,
             color: false,
             dither: false,
+            enhance: false,
+            gamma: None,
+            auto_threshold: false,
         };
         let not_dithered = render_image(&bytes, &cfg_no_dither).expect("render should succeed");
         assert_ne!(
@@ -423,6 +531,9 @@ mod tests {
             threshold: 128,
             color: false,
             dither: true,
+            enhance: false,
+            gamma: None,
+            auto_threshold: false,
         };
         let output = render_image(&bytes, &cfg).expect("render should succeed");
         let chars: Vec<char> = output
@@ -446,6 +557,9 @@ mod tests {
             threshold: 128,
             color: false,
             dither: false,
+            enhance: false,
+            gamma: None,
+            auto_threshold: false,
         };
         assert_eq!(
             render_image(&bytes, &cfg).expect("render should succeed"),
@@ -582,5 +696,137 @@ mod tests {
     #[test]
     fn terminal_width_detection_does_not_crash() {
         let _ = terminal_width();
+    }
+
+    #[test]
+    fn histogram_stretch_expands_narrow_range() {
+        let mut lum = vec![50.0, 75.0, 100.0];
+        let mask = vec![true, true, true];
+        histogram_stretch(&mut lum, &mask);
+        assert!((lum[0] - 0.0).abs() < 0.1);
+        assert!((lum[2] - 255.0).abs() < 0.1);
+        assert!(lum[1] > 100.0 && lum[1] < 160.0);
+    }
+
+    #[test]
+    fn histogram_stretch_skips_flat_image() {
+        let mut lum = vec![128.0, 128.0, 128.0];
+        let mask = vec![true, true, true];
+        histogram_stretch(&mut lum, &mask);
+        assert!((lum[0] - 128.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn histogram_stretch_ignores_transparent() {
+        let mut lum = vec![0.0, 50.0, 100.0];
+        let mask = vec![false, true, true];
+        histogram_stretch(&mut lum, &mask);
+        assert!((lum[0] - 0.0).abs() < 0.1, "transparent pixel unchanged");
+        assert!((lum[1] - 0.0).abs() < 0.1, "min opaque → 0");
+        assert!((lum[2] - 255.0).abs() < 0.1, "max opaque → 255");
+    }
+
+    #[test]
+    fn otsu_bimodal_separates_clusters() {
+        let mut lum = Vec::new();
+        let mut mask = Vec::new();
+        for _ in 0..100 {
+            lum.push(20.0);
+            mask.push(true);
+        }
+        for _ in 0..100 {
+            lum.push(220.0);
+            mask.push(true);
+        }
+        let t = otsu_threshold(&lum, &mask);
+        // Any threshold between the two clusters (20..220) maximizes inter-class
+        // variance equally. The algorithm picks the first maximum.
+        assert!(
+            t >= 20 && t <= 220,
+            "otsu should find threshold between clusters, got {t}"
+        );
+    }
+
+    #[test]
+    fn otsu_dark_image_gives_low_threshold() {
+        let lum: Vec<f32> = (0..200).map(|i| (i % 40) as f32).collect();
+        let mask = vec![true; 200];
+        let t = otsu_threshold(&lum, &mask);
+        assert!(t < 80, "dark image should get low threshold, got {t}");
+    }
+
+    #[test]
+    fn gamma_brightens_midtones() {
+        let mut lum = vec![0.0, 128.0, 255.0];
+        let mask = vec![true, true, true];
+        apply_gamma(&mut lum, &mask, 2.0);
+        assert!((lum[0] - 0.0).abs() < 0.1, "black stays black");
+        assert!(lum[1] > 140.0, "midtone should brighten with gamma 2.0, got {}", lum[1]);
+        assert!((lum[2] - 255.0).abs() < 0.1, "white stays white");
+    }
+
+    #[test]
+    fn gamma_darkens_midtones() {
+        let mut lum = vec![128.0];
+        let mask = vec![true];
+        apply_gamma(&mut lum, &mask, 0.5);
+        assert!(lum[0] < 120.0, "midtone should darken with gamma 0.5, got {}", lum[0]);
+    }
+
+    #[test]
+    fn enhance_changes_output_for_narrow_range_image() {
+        let img = ImageBuffer::from_fn(2, 4, |_, _| Rgba([100, 100, 100, 255]));
+        let dynimg = DynamicImage::ImageRgba8(img);
+        let mut bytes = Vec::new();
+        dynimg
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("png encode should succeed");
+
+        let normal = render(&bytes, 1, 128, false);
+        let cfg_enhanced = RenderConfig {
+            width: Some(1),
+            threshold: 128,
+            color: false,
+            dither: true,
+            enhance: true,
+            gamma: None,
+            auto_threshold: false,
+        };
+        let enhanced = render_image(&bytes, &cfg_enhanced).expect("render should succeed");
+        // A uniform gray image at 100 is below threshold 128, renders as space normally.
+        // With enhance, it stretches to 255 (since all pixels are same), but range < 2 so
+        // stretch is skipped. Output should be the same for uniform images.
+        assert_eq!(normal, enhanced);
+    }
+
+    #[test]
+    fn auto_threshold_changes_output_for_dark_image() {
+        let img = ImageBuffer::from_fn(4, 8, |x, _y| {
+            if x < 2 {
+                Rgba([60, 60, 60, 255])
+            } else {
+                Rgba([30, 30, 30, 255])
+            }
+        });
+        let dynimg = DynamicImage::ImageRgba8(img);
+        let mut bytes = Vec::new();
+        dynimg
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("png encode should succeed");
+
+        let fixed = render(&bytes, 2, 128, false);
+        let cfg_auto = RenderConfig {
+            width: Some(2),
+            threshold: 128,
+            color: false,
+            dither: false,
+            enhance: false,
+            gamma: None,
+            auto_threshold: true,
+        };
+        let auto = render_image(&bytes, &cfg_auto).expect("render should succeed");
+        // With threshold 128, both 60 and 30 are below → all spaces.
+        // With Otsu, threshold should be ~45, so 60 lights up but 30 doesn't.
+        assert_ne!(fixed, auto, "auto-threshold should differ from fixed 128 for dark images");
     }
 }

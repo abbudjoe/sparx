@@ -17,6 +17,9 @@ fn run() -> Result<(), String> {
     let mut threshold: u8 = 128;
     let mut color = true;
     let mut dither = true;
+    let mut enhance = false;
+    let mut gamma = None;
+    let mut auto_threshold = false;
 
     let remaining: Vec<String> = args.collect();
     let mut i = 0;
@@ -40,6 +43,19 @@ fn run() -> Result<(), String> {
                 dither = false;
                 i += 1;
             }
+            "--enhance" => {
+                enhance = true;
+                i += 1;
+            }
+            "--gamma" => {
+                let value = remaining.get(i + 1).ok_or_else(usage)?;
+                gamma = Some(parse_f32(value, "gamma")?);
+                i += 2;
+            }
+            "--auto-threshold" => {
+                auto_threshold = true;
+                i += 1;
+            }
             _ => return Err(format!("Unknown argument: {}\n{}", remaining[i], usage())),
         }
     }
@@ -49,6 +65,9 @@ fn run() -> Result<(), String> {
         threshold,
         color,
         dither,
+        enhance,
+        gamma,
+        auto_threshold,
     };
 
     let rendered = render_file(&image_path, &cfg).map_err(|e| e.to_string())?;
@@ -68,6 +87,12 @@ fn parse_u8(value: &str, name: &str) -> Result<u8, String> {
         .map_err(|_| format!("Invalid {name}: {value}"))
 }
 
+fn parse_f32(value: &str, name: &str) -> Result<f32, String> {
+    value
+        .parse::<f32>()
+        .map_err(|_| format!("Invalid {name}: {value}"))
+}
+
 fn usage() -> String {
-    "Usage: sparx <image_path> [--width N] [--threshold N] [--no-color] [--no-dither]".to_string()
+    "Usage: sparx <image_path> [--width N] [--threshold N] [--no-color] [--no-dither] [--enhance] [--gamma N] [--auto-threshold]".to_string()
 }
